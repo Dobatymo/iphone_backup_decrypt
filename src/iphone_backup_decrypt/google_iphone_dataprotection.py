@@ -6,8 +6,10 @@
 # Original License: https://opensource.org/licenses/BSD-3-Clause
 #####
 
+import logging
 import struct
 from binascii import hexlify
+from itertools import tee
 
 import Crypto.Cipher.AES
 
@@ -16,8 +18,13 @@ try:
 except ImportError:
     from hashlib import pbkdf2_hmac  # but settle for a standard library one if necessary!
 
+    try:
+        import ssl
+    except ImportError:
+        logging.warning("Using slow python implementation of PBKDF2-HMAC")
 
-__all__ = ["Keybag", "AESdecryptCBC"]
+
+__all__ = ["Keybag", "AESdecryptCBC_stream"]
 
 
 _CLASSKEY_TAGS = [b"CLAS", b"WRAP", b"WPKY", b"KTYP", b"PBKY"]  # UUID
@@ -165,16 +172,53 @@ def _AESUnwrap(kek, wrapped):
     return res
 
 
-def AESdecryptCBC(data, key, iv=b"\x00" * 16):
-    if len(data) % 16:
-        print("WARN: AESdecryptCBC: data length not /16, truncating")
-        data = data[0:(len(data)/16) * 16]
-    data = Crypto.Cipher.AES.new(key, Crypto.Cipher.AES.MODE_CBC, iv).decrypt(data)
-    return data
-
-
+# Crypto.Util.Padding.unpad
 def removePadding(data, blocksize=16):
     n = int(data[-1])  # RFC 1423: last byte contains number of padding bytes.
     if n > blocksize or n > len(data):
         raise Exception('Invalid CBC padding')
     return data[:-n]
+
+
+def file_iter(f_in, chunksize):
+    while True:
+        data = f_in.read(chunksize)
+        if data:
+            yield data
+        else:
+            break
+
+
+def AESdecryptCBC_stream(f_in, f_out, key, iv=b"\x00" * 16, chunksize=1024*1024, padding=False):
+    if chunksize % 16 != 0:
+        raise ValueError("chunksize must be a multiple of 16")
+
+    dec = Crypto.Cipher.AES.new(key, Crypto.Cipher.AES.MODE_CBC, iv)
+    a, b = tee(file_iter(f_in, chunksize))
+
+    try:
+        next(a)
+    except StopIteration:
+        return
+
+    try:
+        while True:
+            next(a)
+            f_out.write(dec.decrypt(next(b)))
+    except StopIteration:
+        pass
+
+    last = next(b)
+    if len(last) % 16 == 0:
+        if padding:
+            f_out.write(removePadding(dec.decrypt(last)))
+        else:
+            f_out.write(dec.decrypt(last))
+    else:
+        raise RuntimeError("filesize is not a multiple of 16")
+
+    try:
+        next(b)
+        raise RuntimeError("data left in iterator")
+    except StopIteration:
+        pass

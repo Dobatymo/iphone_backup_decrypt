@@ -1,14 +1,27 @@
+import logging
 import os.path
+import platform
+import re
 import shutil
 import sqlite3
 import struct
 import tempfile
+from io import BytesIO
+from pathlib import Path
 
 import biplist
+from tqdm import tqdm
 
 from . import google_iphone_dataprotection
 
 __all__ = ["EncryptedBackup", "RelativePath", "RelativePathsLike"]
+
+if platform.system() == "Windows":
+    def _fs_filename(name, replacement="_"):
+        return re.sub(r'[<>:"\|\?\*]', replacement, name)
+else:
+    def _fs_filename(name, replacement="_"):
+        return name
 
 
 class RelativePath:
@@ -139,19 +152,17 @@ class EncryptedBackup:
         self._read_and_unlock_keybag()
         # Decrypt the Manifest.db index database:
         manifest_key = self._manifest_plist['ManifestKey'][4:]
-        with open(self._manifest_db_path, 'rb') as encrypted_db_filehandle:
-            encrypted_db = encrypted_db_filehandle.read()
         manifest_class = struct.unpack('<l', self._manifest_plist['ManifestKey'][:4])[0]
         key = self._keybag.unwrapKeyForClass(manifest_class, manifest_key)
-        decrypted_data = google_iphone_dataprotection.AESdecryptCBC(encrypted_db, key)
-        # Write the decrypted Manifest.db temporarily to disk:
-        with open(self._temp_decrypted_manifest_db_path, 'wb') as decrypted_db_filehandle:
-            decrypted_db_filehandle.write(decrypted_data)
+        with open(self._manifest_db_path, 'rb') as f_in:
+            with open(self._temp_decrypted_manifest_db_path, 'wb') as f_out:
+                google_iphone_dataprotection.AESdecryptCBC_stream(f_in, f_out, key)
+
         # Open the temporary database to verify decryption success:
         if not self._open_temp_database():
             raise ConnectionError("Manifest.db file does not seem to be the right format!")
 
-    def _decrypt_inner_file(self, *, file_id, file_bplist):
+    def _decrypt_inner_file(self, f_out, *, file_id, file_bplist):
         # Ensure we've already unlocked the Keybag:
         self._read_and_unlock_keybag()
         # Extract the decryption key from the PList data:
@@ -164,12 +175,8 @@ class EncryptedBackup:
         inner_key = self._keybag.unwrapKeyForClass(protection_class, encryption_key)
         # Find the encrypted version of the file on disk and decrypt it:
         filename_in_backup = os.path.join(self._backup_directory, file_id[:2], file_id)
-        with open(filename_in_backup, 'rb') as encrypted_file_filehandle:
-            encrypted_data = encrypted_file_filehandle.read()
-        # Decrypt the file contents:
-        decrypted_data = google_iphone_dataprotection.AESdecryptCBC(encrypted_data, inner_key)
-        # Remove any padding introduced by the CBC encryption:
-        return google_iphone_dataprotection.removePadding(decrypted_data)
+        with open(filename_in_backup, 'rb') as f_in:
+            google_iphone_dataprotection.AESdecryptCBC_stream(f_in, f_out, inner_key, padding=True)
 
     def test_decryption(self):
         """Validate that the backup can be decrypted successfully."""
@@ -188,6 +195,23 @@ class EncryptedBackup:
             os.makedirs(output_directory, exist_ok=True)
         shutil.copy(self._temp_decrypted_manifest_db_path, output_filename)
 
+    def _get_file_meta(self, relative_path):
+        if self._temp_manifest_db_conn is None:
+            self._decrypt_manifest_db_file()
+
+        cur = self._temp_manifest_db_conn.cursor()
+        query = """
+            SELECT fileID, file
+            FROM Files
+            WHERE relativePath = ?
+            AND flags=1
+            ORDER BY domain, relativePath
+            LIMIT 1;
+        """
+        cur.execute(query, (relative_path,))
+        file_id, file_bplist = cur.fetchone()
+        return file_id, file_bplist
+
     def extract_file_as_bytes(self, relative_path):
         """
         Decrypt a single named file and return the bytes.
@@ -198,28 +222,12 @@ class EncryptedBackup:
             and examining the Files table.
         :return: decrypted bytes of the file.
         """
-        # Ensure that we've initialised everything:
-        if self._temp_manifest_db_conn is None:
-            self._decrypt_manifest_db_file()
-        # Use Manifest.db to find the on-disk filename and file metadata, including the keys, for the file.
-        # The metadata is contained in the 'file' column, as a binary PList file:
-        try:
-            cur = self._temp_manifest_db_conn.cursor()
-            query = """
-                SELECT fileID, file
-                FROM Files
-                WHERE relativePath = ?
-                AND flags=1
-                ORDER BY domain, relativePath
-                LIMIT 1;
-            """
-            cur.execute(query, (relative_path,))
-            result = cur.fetchone()
-        except sqlite3.Error:
-            return None
-        file_id, file_bplist = result
-        # Decrypt the requested file:
-        return self._decrypt_inner_file(file_id=file_id, file_bplist=file_bplist)
+
+        file_id, file_bplist = self._get_file_meta(relative_path)
+
+        with BytesIO as f_out:
+            self._decrypt_inner_file(f_out, file_id=file_id, file_bplist=file_bplist)
+            return f_out.getvalue()
 
     def extract_file(self, *, relative_path, output_filename):
         """
@@ -235,15 +243,14 @@ class EncryptedBackup:
         :param output_filename:
             The filename to write the decrypted file contents to.
         """
-        # Get the decrypted bytes of the requested file:
-        decrypted_data = self.extract_file_as_bytes(relative_path)
-        # Output them to disk:
+        file_id, file_bplist = self._get_file_meta(relative_path)
+
         output_directory = os.path.dirname(output_filename)
         if output_directory:
             os.makedirs(output_directory, exist_ok=True)
-        if decrypted_data is not None:
-            with open(output_filename, 'wb') as outfile:
-                outfile.write(decrypted_data)
+
+        with open(output_filename, 'wb') as f_out:
+            self._decrypt_inner_file(f_out, file_id=file_id, file_bplist=file_bplist)
 
     def extract_files(self, *, relative_paths_like, output_folder):
         """
@@ -284,9 +291,32 @@ class EncryptedBackup:
         for file_id, matched_relative_path, file_bplist in results:
             filename = os.path.basename(matched_relative_path)
             output_path = os.path.join(output_folder, filename)
-            # Decrypt the file:
-            decrypted_data = self._decrypt_inner_file(file_id=file_id, file_bplist=file_bplist)
-            # Output to disk:
-            if decrypted_data is not None:
-                with open(output_path, 'wb') as outfile:
-                    outfile.write(decrypted_data)
+            try:
+                with open(output_path, 'wb') as f_out:
+                    self._decrypt_inner_file(f_out, file_id=file_id, file_bplist=file_bplist)
+            except FileNotFoundError:
+                logging.warning("Skipping <%s>. Path probably too long", output_path)
+
+    def extract_all(self, output_folder, verbose=True):
+
+        out = Path(output_folder)
+        query = "SELECT fileID, relativePath, file FROM Files WHERE flags=1"
+
+        if self._temp_manifest_db_conn is None:
+            self._decrypt_manifest_db_file()
+
+        cur = self._temp_manifest_db_conn.cursor()
+        cur.execute(query)
+
+        for file_id, relative_path, file_bplist in tqdm(cur.fetchall(), disable=None if verbose else True):
+            _relative_path = _fs_filename(relative_path)
+            if relative_path != _relative_path:
+                logging.warning("<%s> was renamed to <%s>", relative_path, _relative_path)
+
+            output_path = out / _relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with output_path.open('wb') as f_out:
+                    self._decrypt_inner_file(f_out, file_id=file_id, file_bplist=file_bplist)
+            except FileNotFoundError:
+                logging.warning("Skipping <%s>. Path probably too long", output_path)
